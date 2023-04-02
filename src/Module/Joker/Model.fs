@@ -54,16 +54,20 @@ type GuildSettingData =
     {
         IsEnabled: bool
         Messages: string []
+        /// in milliseconds
+        Cooldown: int64
     }
-    static member Init isEnabled messages =
+    static member Init isEnabled messages cooldown =
         {
             IsEnabled = isEnabled
             Messages = messages
+            Cooldown = cooldown
         }
     static member Empty =
         {
             IsEnabled = false
             Messages = [||]
+            Cooldown = 0
         }
     static member Serialize (data: GuildSettingData) =
         data |> Json.ser
@@ -105,6 +109,8 @@ type Req =
     | GuildSettingsDbReq of GuildSettingsDbReq<Req>
     | GetAuthorId of Req<unit, UserId, Req>
     | GetAuthorNick of Req<unit, string, Req>
+    | GetLastResponse of Req<unit, System.DateTime, Req>
+    | SetLastResponse of Req<System.DateTime, unit, Req>
     | Response of DiscordMessageSender.Builder option
 [<CompilationRepresentation(CompilationRepresentationFlags.ModuleSuffix)>]
 [<RequireQualifiedAccess>]
@@ -119,6 +125,12 @@ module Req =
 
     let getAuthorNick arg next =
         GetAuthorNick(arg, next)
+
+    let getLastResponse arg next =
+        GetLastResponse(arg, next)
+
+    let updateLastResponse arg next =
+        SetLastResponse(arg, next)
 
     let responseNone =
         Response None
@@ -156,8 +168,19 @@ let startJoke =
         | Left _ ->
             Req.responseNone
 
+    let testCooldownIsReset cooldown next =
+        pipeBackwardBuilder {
+            let! lastResponse = Req.getLastResponse ()
+            let diff = System.DateTime.Now - lastResponse
+            if diff.TotalMilliseconds > float cooldown then
+                return next ()
+            else
+                return Req.responseNone
+        }
+
     pipeBackwardBuilder {
         let! guildSetting = getGuildSetting ()
+        do! testCooldownIsReset guildSetting.Data.Cooldown
         do! testIsEnabled guildSetting
         let rawMessages = guildSetting.Data.Messages
         do! testIsNotEmpty rawMessages
@@ -167,6 +190,7 @@ let startJoke =
         let authorMention = sprintf "<@%d>" authorId
         let! authorNick = Req.getAuthorNick ()
         let content = MessageTemplate.Message.substitute authorMention authorNick message
+        do! Req.updateLastResponse System.DateTime.Now
         let message: DiscordMessageSender.Builder =
             {
                 IsEphemeral = false
@@ -189,13 +213,11 @@ let setIsEnabled isEnabled =
     pipeBackwardBuilder {
         let! guildSetting = getGuildSetting ()
         let guildSetting =
-            {
-                guildSetting with
-                    Data =
-                        {
-                            guildSetting.Data with
-                                IsEnabled = isEnabled
-                        }
+            { guildSetting with
+                Data =
+                    { guildSetting.Data with
+                        IsEnabled = isEnabled
+                    }
             }
         do! Req.guildSettingReq GuildSettingReq.set guildSetting
         let message: DiscordMessageSender.Builder =
@@ -276,12 +298,11 @@ let setMessages messagesJson =
         pipeBackwardBuilder {
             let! guildSetting = getGuildSetting ()
             let guildSetting =
-                {
-                    guildSetting with
-                        Data =
-                            { guildSetting.Data with
-                                Messages = rawMessages
-                            }
+                { guildSetting with
+                    Data =
+                        { guildSetting.Data with
+                            Messages = rawMessages
+                        }
                 }
             do! Req.guildSettingReq GuildSettingReq.set guildSetting
             return next ()
@@ -317,6 +338,56 @@ let getMessages =
                 IsEphemeral = true
                 Message =
                     sprintf "List:\n%s" messages
+                    |> DiscordMessageSender.Message.createSimple
+            }
+        return Req.response message
+    }
+
+let setCooldown cooldown =
+    let setCooldown cooldown next =
+        pipeBackwardBuilder {
+            let! guildSetting = getGuildSetting ()
+            let guildSetting =
+                {
+                    guildSetting with
+                        Data =
+                            { guildSetting.Data with
+                                Cooldown = cooldown
+                            }
+                }
+            do! Req.guildSettingReq GuildSettingReq.set guildSetting
+            return next ()
+        }
+
+    pipeBackwardBuilder {
+        do! setCooldown cooldown
+
+        let message: DiscordMessageSender.Builder =
+            {
+                IsEphemeral = true
+                Message =
+                    "Done!"
+                    |> DiscordMessageSender.Message.createSimple
+            }
+        return Req.response message
+    }
+
+let getCooldown =
+    pipeBackwardBuilder {
+        let! guildSetting = getGuildSetting ()
+
+        let messages =
+            let cooldown = guildSetting.Data.Cooldown
+            if cooldown > 0 then
+                sprintf "%dms" cooldown
+            else
+                "not set"
+
+        let message: DiscordMessageSender.Builder =
+            {
+                IsEphemeral = true
+                Message =
+                    sprintf "Cooldown is %s" messages
                     |> DiscordMessageSender.Message.createSimple
             }
         return Req.response message

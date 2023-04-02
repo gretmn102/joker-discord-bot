@@ -10,6 +10,7 @@ open Joker
 type State =
     {
         GuildSettings: Model.GuildSettings
+        LastResponseDateTime: System.DateTime
     }
 
 type Request =
@@ -17,6 +18,8 @@ type Request =
     | GetIsEnabled
     | SetMessages of json: string
     | GetMessages
+    | SetCooldown of int64
+    | GetCooldown
 
 type Req =
     | Typing of DiscordClient * EventArgs.TypingStartEventArgs
@@ -69,10 +72,10 @@ let reduce msg (state: State) =
             | Model.GuildSettingsDbReq cmd ->
                 let guildId, localState = LocalState.getGuildId getGuildId localState
                 let res, guildSettings = Model.GuildSettings.interp guildId cmd state.GuildSettings
-                let state = {
-                    state with
+                let state =
+                    { state with
                         GuildSettings = guildSettings
-                }
+                    }
                 loop localState res state
 
             | Model.GetAuthorNick((), next) ->
@@ -83,6 +86,18 @@ let reduce msg (state: State) =
             | Model.GetAuthorId((), next) ->
                 let authorMember, localState = LocalState.getAuthorMember getAuthorMember localState
                 let req = next authorMember.Id
+                loop localState req state
+
+            | Model.GetLastResponse((), next) ->
+                let req = next state.LastResponseDateTime
+                loop localState req state
+
+            | Model.SetLastResponse(dateTime, next) ->
+                let req = next ()
+                let state =
+                    { state with
+                        LastResponseDateTime = dateTime
+                    }
                 loop localState req state
 
             | Model.Response msg ->
@@ -147,11 +162,16 @@ let reduce msg (state: State) =
             Model.setMessages json
         | GetMessages ->
             Model.getMessages
+        | SetCooldown cooldown ->
+            Model.setCooldown cooldown
+        | GetCooldown ->
+            Model.getCooldown
         |> interp
 
 let createReducer db =
     let init = {
         GuildSettings = Model.GuildSettings.init "jokerGuildSettings" db
+        LastResponseDateTime = System.DateTime.MinValue
     }
 
     MailboxProcessor.Start (fun mail ->
@@ -319,6 +339,75 @@ let create (db: MongoDB.Driver.IMongoDatabase) =
                             false
                 |}
 
+            let cooldown =
+                let commandName = "cooldown"
+
+                let setName = "set"
+                let setOptName = "ms"
+
+                let getName = "get"
+
+                {|
+                    Command =
+                        Entities.DiscordApplicationCommandOption(
+                            commandName,
+                            "set cooldown",
+                            ApplicationCommandOptionType.SubCommandGroup,
+                            options = [|
+                                Entities.DiscordApplicationCommandOption(
+                                    setName,
+                                    "set",
+                                    ApplicationCommandOptionType.SubCommand,
+                                    options = [|
+                                        Entities.DiscordApplicationCommandOption(
+                                            setOptName,
+                                            "cooldown in milliseconds",
+                                            ApplicationCommandOptionType.Integer,
+                                            required = true
+                                        )
+                                    |]
+                                )
+                                Entities.DiscordApplicationCommandOption(
+                                    getName,
+                                    "get",
+                                    ApplicationCommandOptionType.SubCommand
+                                )
+                            |]
+                        )
+
+                    Handler = fun (e: EventArgs.InteractionCreateEventArgs) (data: Entities.DiscordInteractionDataOption) ->
+                        if data.Name = commandName then
+                            data.Options
+                            |> Seq.iter (fun data ->
+                                if data.Name = getName then
+                                    reducer.Post(InteractionRequest (e, GetCooldown))
+
+                                elif data.Name = setName then
+                                    let cooldownOpt =
+                                        data.Options
+                                        |> Seq.tryPick (fun x ->
+                                            if x.Name = setOptName then
+                                                let v = x.Value :?> int64
+                                                let v = if v > 0 then v else 0
+                                                Some v
+                                            else
+                                                None
+                                        )
+                                    match cooldownOpt with
+                                    | Some cooldown ->
+                                        reducer.Post(InteractionRequest (e, SetCooldown cooldown))
+                                    | None ->
+                                        failwithf "not found `%A` in %A" setOptName (List.ofSeq data.Options)
+
+                                else
+                                    failwithf "%A not implemented yet" data.Name
+                            )
+
+                            true
+                        else
+                            false
+                |}
+
             let slashCommandName = "joker-prefs"
 
             InteractionCommand.SlashCommand {|
@@ -330,6 +419,7 @@ let create (db: MongoDB.Driver.IMongoDatabase) =
                         [|
                             isEnabled.Command
                             messageTemplates.Command
+                            cooldown.Command
                         |],
                         ``type`` = ApplicationCommandType.SlashCommand,
                         name_localizations = Map [
@@ -343,6 +433,7 @@ let create (db: MongoDB.Driver.IMongoDatabase) =
                         let isHandled =
                             isEnabled.Handler e data
                             || messageTemplates.Handler e data
+                            || cooldown.Handler e data
 
                         if not isHandled then
                             failwithf "%A not implemented yet" data.Name
